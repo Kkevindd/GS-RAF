@@ -312,11 +312,11 @@ class GaussianModel:
         max_bound = self._anchor.max(dim=0)[0]
         voxel_size = (max_bound - min_bound) / grid_size
         
-        # 初始化网格
-        voxel_grid = torch.zeros((35, grid_size, grid_size, grid_size), device=device, requires_grad=True)
+        # 初始化网格（不需要梯度，仅作为local_pooling_net的输入）
+        voxel_grid = torch.zeros((35, grid_size, grid_size, grid_size), device=device, requires_grad=False)
         
         # 计算体素索引
-        indices = ((self._anchor - min_bound) / voxel_size).long().clamp(0, grid_size-1)
+        indices = (((self._anchor.detach()) - min_bound.detach()) / voxel_size.detach()).long().clamp(0, grid_size-1)
         d, h, w = indices[:, 0], indices[:, 1], indices[:, 2]
         
         # 创建线性索引
@@ -326,10 +326,10 @@ class GaussianModel:
         count_flat = torch.bincount(linear_indices, minlength=grid_size**3)
         count_grid = count_flat.view(grid_size, grid_size, grid_size)
         
-        # 累加特征
-        feat_flat = torch.zeros(32, grid_size**3, device=device, requires_grad=True)
+        # 累加特征（在无梯度模式下累加，避免leaf view就地写入问题）
+        feat_flat = torch.zeros(32, grid_size**3, device=device, requires_grad=False)
         for c in range(32):
-            feat_flat[c].scatter_add_(0, linear_indices, self._anchor_feat[:, c])
+            feat_flat[c].scatter_add_(0, linear_indices, (self._anchor_feat.detach())[:, c])
         
         feat_grid = feat_flat.view(32, grid_size, grid_size, grid_size)
         
@@ -422,14 +422,7 @@ class GaussianModel:
         
         # 初始化局部特征池化网络（保持通道数，只池化空间维度）
         if not hasattr(self, 'local_pooling_net'):
-            self.local_pooling_net = nn.Sequential(
-                # 使用3D卷积进行特征提取，保持通道数70
-                nn.Conv3d(70, 70, kernel_size=3, padding=1, groups=70),  # depth-wise conv
-                nn.BatchNorm3d(70),
-                nn.ReLU(inplace=True),
-                # 自适应平均池化：9x9x9 -> 1x1x1
-                nn.AdaptiveAvgPool3d(1)
-            ).cuda()
+            self.local_pooling_net = LocalPoolingNet().cuda()
         
         # 通过网络：[B, 70, 9, 9, 9] -> [B, 70, 1, 1, 1]
         local_feat = self.local_pooling_net(local_features)
@@ -531,12 +524,7 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
             ]
-            # 添加ResNet3D参数到优化器（如果存在）
-            if hasattr(self, 'resnet3d'):
-                l.append({'params': self.resnet3d.parameters(), 'lr': training_args.feature_lr * 0.1, "name": "resnet3d"})
-            # 添加局部池化网络参数到优化器（如果存在）
-            if hasattr(self, 'local_pooling_net'):
-                l.append({'params': self.local_pooling_net.parameters(), 'lr': training_args.feature_lr * 0.1, "name": "local_pooling_net"})
+            
         elif self.appearance_dim > 0:
             l = [
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
@@ -551,12 +539,7 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
             ]
-            # 添加ResNet3D参数到优化器（如果存在）
-            if hasattr(self, 'resnet3d'):
-                l.append({'params': self.resnet3d.parameters(), 'lr': training_args.feature_lr * 0.1, "name": "resnet3d"})
-            # 添加局部池化网络参数到优化器（如果存在）
-            if hasattr(self, 'local_pooling_net'):
-                l.append({'params': self.local_pooling_net.parameters(), 'lr': training_args.feature_lr * 0.1, "name": "local_pooling_net"})
+            
         else:
             l = [
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
@@ -570,12 +553,7 @@ class GaussianModel:
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
             ]
-            # 添加ResNet3D参数到优化器（如果存在）
-            if hasattr(self, 'resnet3d'):
-                l.append({'params': self.resnet3d.parameters(), 'lr': training_args.feature_lr * 0.1, "name": "resnet3d"})
-            # 添加局部池化网络参数到优化器（如果存在）
-            if hasattr(self, 'local_pooling_net'):
-                l.append({'params': self.local_pooling_net.parameters(), 'lr': training_args.feature_lr * 0.1, "name": "local_pooling_net"})
+            
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -1433,6 +1411,78 @@ class ResNet3D_helper(nn.Module):
         # return resnet_feature_1, resnet_feature_2, resnet_feature_3, resnet_feature_4, resnet_feature_5, resnet_feature_6
 
 
+class LocalPoolingNet(nn.Module):
+    def __init__(self):
+        super(LocalPoolingNet, self).__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(70, 70, kernel_size=3, padding=1, groups=70),
+            nn.BatchNorm3d(70),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool3d(1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class SimplePool3D(nn.Module):
+    def __init__(self, input_channels=35, hidden_dim=256, output_channels=35, pool_size=8):
+        """
+        GridMLPWithPooling: 先进行空间下采样，再应用MLP，减少参数量
+        
+        Args:
+            input_channels: 输入通道数，默认为35
+            hidden_dim: 隐藏层维度，默认为256
+            output_channels: 输出通道数，默认为35
+            pool_size: 空间下采样后的尺寸，默认为8
+        """
+        super(SimplePool3D, self).__init__()
+        
+        self.input_channels = input_channels
+        self.hidden_dim = hidden_dim
+        self.output_channels = output_channels
+        self.pool_size = pool_size
+        
+        # 自适应平均池化，将空间维度降低到pool_size
+        self.adaptive_pool = nn.AdaptiveAvgPool3d((pool_size, pool_size, pool_size))
+        
+        # 计算池化后的输入维度
+        self.pooled_dim = input_channels * pool_size * pool_size * pool_size
+        
+        # 两层MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(self.pooled_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, output_channels)
+        )
+        
+    def forward(self, x):
+        """
+        前向传播
+        
+        Args:
+            x: 输入张量，形状为 [B, C, D, H, W]
+            
+        Returns:
+            输出张量，形状为 [B, C, 1, 1, 1]
+        """
+        B, C, D, H, W = x.shape
+        
+        # 先进行空间下采样: [B, C, D, H, W] -> [B, C, pool_size, pool_size, pool_size]
+        x_pooled = self.adaptive_pool(x)
+        
+        # 展平: [B, C*pool_size*pool_size*pool_size]
+        x_flat = x_pooled.view(B, -1)
+        
+        # 通过MLP: [B, C*pool_size^3] -> [B, output_channels]
+        x_mlp = self.mlp(x_flat)
+        
+        # 重塑为 [B, output_channels, 1, 1, 1]
+        x_out = x_mlp.view(B, self.output_channels, 1, 1, 1)
+        
+        return x_out
+    
+
+    # simple sound field head (same as NeRAF NeRAFAudioSoundField)
 class NeRAFAudioSoundField(nn.Module):
 
     def __init__(self,in_size,W,sound_rez=2,N_frequencies=257):
