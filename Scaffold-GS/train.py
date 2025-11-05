@@ -150,21 +150,21 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     logger.info(f"[Audio] Audio network input size: {in_size}")
     audio_field = NeRAFAudioSoundField(in_size=in_size, W=audio_W, sound_rez=1, N_frequencies=audio_F).cuda()
 
-    # optimizer for audio only - 参考NeRAF配置，但考虑声场训练10轮的情况
+    # optimizer for audio only - 参考NeRAF配置
     audio_lr_init = 1e-4
     audio_lr_final = 1e-8  # NeRAF使用更小的最终学习率
     audio_lr_delay_mult = 0.01
-    audio_lr_max_steps = 200000  # 声场训练的总步数：光场10万轮 × 10 = 声场100万轮
-    start_step_audio = 2000  # 音频训练开始步数（对应光场1000轮）
+    audio_lr_max_steps = 200000  
+    start_step_audio = 2000  
     
     # 创建音频学习率调度器 - 基于声场训练步数而不是iteration
     from utils.general_utils import get_expon_lr_func
     audio_scheduler_args = get_expon_lr_func(
         lr_init=audio_lr_init,
         lr_final=audio_lr_final,
-        lr_delay_steps=start_step_audio,  # 延迟到10000步开始（对应光场1000轮）
+        lr_delay_steps=start_step_audio,  
         lr_delay_mult=audio_lr_delay_mult,
-        max_steps=audio_lr_max_steps + start_step_audio/10  # 总步数包含延迟步数
+        max_steps=audio_lr_max_steps + start_step_audio  # 总步数包含延迟步数
     )
     
     # 添加全局音频步数计数器
@@ -391,9 +391,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
                 # ---------------- Train audio after 15000 iterations ----------------
         if raf_loader is not None and iteration >= start_step_audio:   #训练声场
-            # 声场训练：每次进入时训练10轮
-            logger.info(f"[Training Mode] Iteration {iteration}: 开始声场训练（10轮）")
-            for audio_step in range(1):
+            # 声场训练：每次进入时训练n轮，n=1
+            n = 1
+            logger.info(f"[Training Mode] Iteration {iteration}: 开始声场训练（{n}轮）")
+            for audio_step in range(n):
                 # 更新音频学习率 - 基于全局音频步数
                 global_audio_step += 1
                 current_audio_lr = audio_scheduler_args(global_audio_step)
