@@ -27,6 +27,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scene import NeRAFAudioSoundField
 
+import subprocess
+cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
+result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
+os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+
+os.system('echo $CUDA_VISIBLE_DEVICES')
+
+
 # 导入声学指标计算函数
 try:
     import pyroomacoustics
@@ -400,18 +408,18 @@ def load_audio_model(checkpoint_path, device, use_local_features=True):
     if use_local_features:
         grid_feat_dim = 70  # 局部特征维度
         print(f"✓ Using LOCAL features (70-dim) extracted from full grid")
-        
-        # 加载local_pooling_net（如果存在）
         if checkpoint.get("local_pooling_net") is not None:
-            pooling_net = nn.Sequential(
-                nn.Conv3d(70, 70, kernel_size=3, padding=1, groups=70),  # depth-wise conv
-                nn.BatchNorm3d(70),
-                nn.ReLU(inplace=True),
-                nn.AdaptiveAvgPool3d(1)
-            ).to(device)
-            pooling_net.load_state_dict(checkpoint["local_pooling_net"])
-            pooling_net.eval()
-            print(f"✓ Loaded local_pooling_net from checkpoint")
+                # 需要导入LocalPoolingNet类
+                try:
+                    from scene.gaussian_model import LocalPoolingNet
+                    pooling_net = LocalPoolingNet().to(device)
+                    pooling_net.load_state_dict(checkpoint["local_pooling_net"])
+                    pooling_net.eval()
+                    print(f"✓ Loaded local_pooling_net from checkpoint")
+                except Exception as e:
+                    print(f"⚠ Failed to load LocalPoolingNet class: {e}")
+                    print(f"⚠ Will use average pooling instead")
+                    pooling_net = None
         else:
             print(f"⚠ local_pooling_net not found in checkpoint, will use average pooling")
     else:
