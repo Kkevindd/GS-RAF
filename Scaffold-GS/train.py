@@ -25,7 +25,7 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
-from scene import Scene, GaussianModel
+from scene import Scene, GaussianModel,NeRAFAudioSoundField
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -136,24 +136,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     pos_dim = pos_enc.get_out_dim()
     rot_dim = rot_enc.get_out_dim()
 
-    # simple sound field head (same as NeRAF NeRAFAudioSoundField)
-    class NeRAFAudioSoundField(nn.Module):
-        def __init__(self, in_size, W, sound_rez=1, N_frequencies=513):
-            super().__init__()
-            self.soundfield = nn.ModuleList([
-                nn.Linear(in_size, 5096), nn.Linear(5096, 2048),
-                nn.Linear(2048, 1024), nn.Linear(1024, 1024),
-                nn.Linear(1024, W)
-            ])
-            self.STFT_linear = nn.ModuleList([nn.Linear(W, N_frequencies) for _ in range(sound_rez)])
-        def forward(self, h):
-            for layer in self.soundfield:
-                h = F.leaky_relu(layer(h), negative_slope=0.1)
-            output = []
-            for layer in self.STFT_linear:
-                y = torch.tanh(layer(h)) * 10
-                output.append(y.unsqueeze(1))
-            return torch.cat(output, dim=1)  # [B, sound_rez, F]
+
 
     # model heads
     audio_W = 512
@@ -171,15 +154,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     audio_lr_init = 1e-4
     audio_lr_final = 1e-8  # NeRAF使用更小的最终学习率
     audio_lr_delay_mult = 0.01
-    audio_lr_max_steps = 1000000  # 声场训练的总步数：光场10万轮 × 10 = 声场100万轮
-    start_step_audio = 10000  # 音频训练开始步数（对应光场1000轮）
+    audio_lr_max_steps = 200000  # 声场训练的总步数：光场10万轮 × 10 = 声场100万轮
+    start_step_audio = 2000  # 音频训练开始步数（对应光场1000轮）
     
     # 创建音频学习率调度器 - 基于声场训练步数而不是iteration
     from utils.general_utils import get_expon_lr_func
     audio_scheduler_args = get_expon_lr_func(
         lr_init=audio_lr_init,
         lr_final=audio_lr_final,
-        lr_delay_steps=start_step_audio/10,  # 延迟到10000步开始（对应光场1000轮）
+        lr_delay_steps=start_step_audio,  # 延迟到10000步开始（对应光场1000轮）
         lr_delay_mult=audio_lr_delay_mult,
         max_steps=audio_lr_max_steps + start_step_audio/10  # 总步数包含延迟步数
     )
@@ -187,10 +170,23 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     # 添加全局音频步数计数器
     global_audio_step = 0
     
-    optimizer_audio = torch.optim.Adam(
-        list(audio_field.parameters()),
-        lr=audio_lr_init, eps=1e-15  # 使用NeRAF的eps值
-    )
+    # 将local_pooling_net加入音频优化器（独立参数组，较小学习率）
+    param_groups = [
+        {
+            'params': list(audio_field.parameters())
+                      + list(time_enc.parameters())
+                      + list(pos_enc.parameters())
+                      + list(rot_enc.parameters()),
+            'lr': audio_lr_init
+        }
+    ]
+    if hasattr(gaussians, 'local_pooling_net') and gaussians.local_pooling_net is not None:
+        param_groups.append({
+            'params': gaussians.local_pooling_net.parameters(),
+            'lr': audio_lr_init 
+        })
+
+    optimizer_audio = torch.optim.Adam(param_groups, lr=audio_lr_init, eps=1e-15)
     criterion_audio = STFTLoss(loss_type='mse')  # 使用NeRAF的STFTLoss
 
     # ---------------- RAF dataset (optional) setup ----------------
@@ -198,10 +194,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     raf_eval_loader = None
     raf_iter = None
     raf_eval_iter = None
+
+
+    # 修改数据加载器创建部分
     try:
         raf_data_root = getattr(dataset, 'raf_data', '') if hasattr(dataset, 'raf_data') else ''
         raf_fs = int(getattr(dataset, 'raf_fs', 48000))
         raf_max_len_s = float(getattr(dataset, 'raf_max_len', 0.32))
+        
         if isinstance(raf_data_root, str) and len(raf_data_root) > 0 and os.path.isdir(raf_data_root):
             logger.info(f"[RAF] Using raf_data={raf_data_root}, fs={raf_fs}, max_len_s={raf_max_len_s}")
             dp_cfg = RAFDataParserConfig(data=Path(raf_data_root))
@@ -210,6 +210,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             dpo_test  = dp.get_dataparser_outputs(split="test")
             hop_len = 256 if raf_fs == 48000 else 128
             max_len_frames = max(1, int(raf_max_len_s * raf_fs / hop_len))
+            
             raf_train_ds = RAFDataset(
                 dataparser_outputs=dpo_train,
                 mode='train',
@@ -220,24 +221,68 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             )
             raf_eval_ds = RAFDataset(
                 dataparser_outputs=dpo_test,
-                mode='eval',                     # 单帧切片评估；若要整段，改 'eval' 为你定义的整段模式
+                mode='eval',
                 max_len=max_len_frames,
                 max_len_time=raf_max_len_s,
                 wav_path=os.path.join(raf_data_root, 'data'),
                 fs=raf_fs, hop_len=hop_len,
             )
-            raf_loader = DataLoader(raf_train_ds, batch_size=128, shuffle=True, num_workers=8, pin_memory=True)
-            raf_eval_loader = DataLoader(raf_eval_ds, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+            
+            # 关键修改：优化数据加载器配置
+            import multiprocessing as mp
+            
+            # 设置多进程启动方法（在aarch64上很重要）
+            try:
+                mp.set_start_method('spawn', force=True)
+            except RuntimeError:
+                pass  # 如果已经设置过，忽略错误
+            
+            # 计算最优的worker数量（针对aarch64优化）
+            cpu_count = os.cpu_count()
+            if cpu_count >= 64:  # 大系统
+                optimal_workers = min(16, cpu_count // 8)  # 保守设置
+            elif cpu_count >= 16:  # 中等系统
+                optimal_workers = min(2, cpu_count // 8)
+            else:  # 小系统
+                optimal_workers = 1
+                
+            logger.info(f"[RAF] 检测到 {cpu_count} 个CPU核心，使用 {optimal_workers} 个数据加载worker")
+            
+            # 使用更安全的数据加载器配置
+            raf_loader = DataLoader(
+                raf_train_ds, 
+                batch_size=2048, 
+                shuffle=True, 
+                num_workers=optimal_workers, 
+                pin_memory=True,
+                persistent_workers=optimal_workers > 0,  # 只有worker>0时才持久化
+                timeout=30,  # 设置超时
+                multiprocessing_context='spawn' if optimal_workers > 0 else None
+            )
+            raf_eval_loader = DataLoader(
+                raf_eval_ds, 
+                batch_size=2048, 
+                shuffle=False, 
+                num_workers=optimal_workers, 
+                pin_memory=True,
+                persistent_workers=optimal_workers > 0,
+                timeout=30,
+                multiprocessing_context='spawn' if optimal_workers > 0 else None
+            )
+            
             raf_iter = iter(raf_loader)
             raf_eval_iter = iter(raf_eval_loader)
-            logger.info(f"[RAF] Train items: {len(raf_train_ds)} | Eval items: {len(raf_eval_ds)} | max_len_frames: {max_len_frames} | hop_len: {hop_len}")
+            logger.info(f"[RAF] Train items: {len(raf_train_ds)} | Eval items: {len(raf_eval_ds)}")
+            
         else:
             if isinstance(raf_data_root, str) and len(raf_data_root) > 0:
                 logger.info(f"[RAF] Provided raf_data not found or not a directory: {raf_data_root}")
     except Exception as e:
         logger.info(f"[RAF] Failed to initialize RAF loader: {e}")
-        
-        # -------- audio checkpoint helpers --------
+        # 记录详细错误信息以便调试
+        import traceback
+        logger.info(f"[RAF] Error details: {traceback.format_exc()}")
+    
     audio_ckpt_dir = os.path.join(dataset.model_path, "audio_ckpts")
     os.makedirs(audio_ckpt_dir, exist_ok=True)
 
@@ -386,12 +431,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 rot_feat = rot_enc(rot)
 
                 # 3) grid feature from ScaffoldGS - 提取扬声器和听者周围9x9x9局部网格
+                # 允许反向到 local_pooling_net（但不会反向到Gaussians几何）
                 with torch.no_grad():
-                    # 使用扬声器和听者位置提取局部特征
                     grid_feat = gaussians.get_feature(
-                        speaker_pose=src_pose,  # [B, 3]
-                        listener_pose=mic_pose   # [B, 3]
-                    ).to('cuda')  # [B, 70] - 局部特征（9x9x9扬声器 + 9x9x9听者 拼接池化）
+                        speaker_pose=src_pose,
+                        listener_pose=mic_pose
+                    ).to('cuda')  # [B, 70]
 
                 # 4) concat and forward audio field
                 h = torch.cat([grid_feat, t_feat, mic_feat, src_feat, rot_feat], dim=-1)  # [B, in_size]
@@ -506,11 +551,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         rot_feat = rot_enc(rot)
 
                         with torch.no_grad():
-                            # 使用扬声器和听者位置提取局部特征（评估模式）
                             grid_feat = gaussians.get_feature(
-                                speaker_pose=src_pose,  # [B, 3]
-                                listener_pose=mic_pose   # [B, 3]
-                            ).to('cuda')  # [B, 70] - 局部特征
+                                    speaker_pose=src_pose,  # [B, 3]
+                                    listener_pose=mic_pose   # [B, 3]
+                                ).to('cuda')  # [B, 70] - 局部特征
 
                         h = torch.cat([grid_feat, t_feat, mic_feat, src_feat, rot_feat], dim=-1)
                         with torch.no_grad():
@@ -900,23 +944,7 @@ def evaluate_audio_field_periodic(model_path, raf_data_root, raf_fs, raf_max_len
         grid_feat_dim = 70  # 局部网格特征维度
         in_size = grid_feat_dim + time_dim + 2 * pos_dim + rot_dim
         
-        class NeRAFAudioSoundField(nn.Module):
-            def __init__(self, in_size, W, sound_rez=1, N_frequencies=513):
-                super().__init__()
-                self.soundfield = nn.ModuleList([
-                    nn.Linear(in_size, 5096), nn.Linear(5096, 2048),
-                    nn.Linear(2048, 1024), nn.Linear(1024, 1024),
-                    nn.Linear(1024, W)
-                ])
-                self.STFT_linear = nn.ModuleList([nn.Linear(W, N_frequencies) for _ in range(sound_rez)])
-            def forward(self, h):
-                for layer in self.soundfield:
-                    h = F.leaky_relu(layer(h), negative_slope=0.1)
-                output = []
-                for layer in self.STFT_linear:
-                    y = torch.tanh(layer(h)) * 10
-                    output.append(y.unsqueeze(1))
-                return torch.cat(output, dim=1)
+        
         
         audio_field = NeRAFAudioSoundField(in_size=in_size, W=audio_W, sound_rez=1, N_frequencies=audio_F)
         
@@ -1100,23 +1128,7 @@ def evaluate_audio_field(model_path, raf_data_root, raf_fs, raf_max_len_s, hop_l
         grid_feat_dim = 70  # 局部网格特征维度
         in_size = grid_feat_dim + time_dim + 2 * pos_dim + rot_dim
         
-        class NeRAFAudioSoundField(nn.Module):
-            def __init__(self, in_size, W, sound_rez=1, N_frequencies=513):
-                super().__init__()
-                self.soundfield = nn.ModuleList([
-                    nn.Linear(in_size, 5096), nn.Linear(5096, 2048),
-                    nn.Linear(2048, 1024), nn.Linear(1024, 1024),
-                    nn.Linear(1024, W)
-                ])
-                self.STFT_linear = nn.ModuleList([nn.Linear(W, N_frequencies) for _ in range(sound_rez)])
-            def forward(self, h):
-                for layer in self.soundfield:
-                    h = F.leaky_relu(layer(h), negative_slope=0.1)
-                output = []
-                for layer in self.STFT_linear:
-                    y = torch.tanh(layer(h)) * 10
-                    output.append(y.unsqueeze(1))
-                return torch.cat(output, dim=1)
+    
         
         audio_field = NeRAFAudioSoundField(in_size=in_size, W=audio_W, sound_rez=1, N_frequencies=audio_F)
         
@@ -1290,8 +1302,8 @@ if __name__ == "__main__":
     parser.add_argument('--use_wandb', action='store_true', default=False)
     # parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 7_000, 30_000])
     # parser.add_argument("--save_iterations", nargs="+", type=int, default=[3_000, 7_000, 30_000])
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[20_000,50_000,80_000,120_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[20_000,50_000,80_000,120_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[20_000,30000,40000,50_000,60000,70000,80_000,90000,100000,110000,120_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[20_000,30000,40000,50_000,60000,70000,80_000,90000,100000,110000,120_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
