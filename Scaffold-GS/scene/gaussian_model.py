@@ -1,3 +1,4 @@
+     
 #
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
@@ -232,10 +233,15 @@ class GaussianModel:
     
     
     
-    def get_feature(self):
+    def get_full_grid(self):
+        """
+        获取完整的128×128×128网格（用于保存checkpoint）
+        
+        返回:
+            [35, 128, 128, 128] 完整网格
+        """
         device = self.device
-        N = self._anchor.shape[0]
-        grid_size=128
+        grid_size = 128
         
         # 计算边界和体素大小
         min_bound = self._anchor.min(dim=0)[0]
@@ -256,18 +262,17 @@ class GaussianModel:
         count_flat = torch.bincount(linear_indices, minlength=grid_size**3)
         count_grid = count_flat.view(grid_size, grid_size, grid_size)
         
-        # 使用scatter_add_累加所有特征
+        # 累加特征
         feat_flat = torch.zeros(32, grid_size**3, device=device)
         for c in range(32):
             feat_flat[c].scatter_add_(0, linear_indices, self._anchor_feat[:, c])
         
-        # 重塑特征网格
         feat_grid = feat_flat.view(32, grid_size, grid_size, grid_size)
         
         # 计算平均特征
         valid_mask = count_grid > 0
         for c in range(32):
-            feat_grid[c, valid_mask] /= count_grid[valid_mask].float()
+            feat_grid[c] = torch.where(valid_mask, feat_grid[c] / count_grid.float(), feat_grid[c])
         
         voxel_grid[:32] = feat_grid
         
@@ -282,36 +287,157 @@ class GaussianModel:
         voxel_grid[32] = min_bound[0] + i * voxel_size[0]
         voxel_grid[33] = min_bound[1] + j * voxel_size[1]
         voxel_grid[34] = min_bound[2] + k * voxel_size[2]
-        #print(voxel_grid)
-        # x_coords = voxel_grid[32]  # 所有体素的X坐标
+        
+        return voxel_grid  # [35, 128, 128, 128]
     
-        # # 计算大于0的体素数量
-        # positive_x_count = (x_coords > 0).sum().item()
-        # total_voxels = grid_size ** 3
+    def get_feature(self, speaker_pose=None, listener_pose=None, local_size=9):
+        """
+        提取网格特征
         
-        # print(f"体素网格大小: {grid_size}x{grid_size}x{grid_size} = {total_voxels} 个体素")
-        # print(f"X坐标大于0的体素数量: {positive_x_count}")
-        # print(f"占比: {positive_x_count/total_voxels*100:.2f}%")
+        参数:
+            speaker_pose: [B, 3] 扬声器位置（可选）
+            listener_pose: [B, 3] 听者位置（可选）
+            local_size: int, 局部网格大小（默认9）
         
-        # # 打印一些统计信息
-        # print(f"X坐标范围: [{x_coords.min().item():.4f}, {x_coords.max().item():.4f}]")
-        # print(f"场景边界: X=[{min_bound[0].item():.4f}, {max_bound[0].item():.4f}]")
-        self.resnet3d=ResNet3D_helper(
-                in_channels=35, 
-                backbone='resnet50', 
-                pretrained=False, 
-                grid_step=1/grid_size, 
-                N_features=1024
-            )
+        返回:
+            如果提供位姿: [B, 70] 局部特征（扬声器+听者拼接后池化）
+            否则: [1024] 全局特征（向后兼容）
+        """
+        device = self.device
+        N = self._anchor.shape[0]
+        grid_size = 128
         
-        feat_grid =voxel_grid.cpu().unsqueeze(0)
-        res_feat = self.resnet3d(feat_grid)
-        feat_grid = res_feat 
-        feat_grid = feat_grid.flatten()
-       
+        # 计算边界和体素大小
+        min_bound = self._anchor.min(dim=0)[0]
+        max_bound = self._anchor.max(dim=0)[0]
+        voxel_size = (max_bound - min_bound) / grid_size
         
+        # 初始化网格
+        voxel_grid = torch.zeros((35, grid_size, grid_size, grid_size), device=device, requires_grad=True)
         
-        return feat_grid
+        # 计算体素索引
+        indices = ((self._anchor - min_bound) / voxel_size).long().clamp(0, grid_size-1)
+        d, h, w = indices[:, 0], indices[:, 1], indices[:, 2]
+        
+        # 创建线性索引
+        linear_indices = d * (grid_size * grid_size) + h * grid_size + w
+        
+        # 使用bincount计算每个体素的锚点数量
+        count_flat = torch.bincount(linear_indices, minlength=grid_size**3)
+        count_grid = count_flat.view(grid_size, grid_size, grid_size)
+        
+        # 累加特征
+        feat_flat = torch.zeros(32, grid_size**3, device=device, requires_grad=True)
+        for c in range(32):
+            feat_flat[c].scatter_add_(0, linear_indices, self._anchor_feat[:, c])
+        
+        feat_grid = feat_flat.view(32, grid_size, grid_size, grid_size)
+        
+        # 计算平均特征
+        valid_mask = count_grid > 0
+        for c in range(32):
+            feat_grid[c] = torch.where(valid_mask, feat_grid[c] / count_grid.float(), feat_grid[c])
+        
+        voxel_grid[:32] = feat_grid
+        
+        # 计算体素中心坐标
+        i, j, k = torch.meshgrid(
+            torch.arange(0.5, grid_size, device=device),
+            torch.arange(0.5, grid_size, device=device),
+            torch.arange(0.5, grid_size, device=device),
+            indexing='ij'
+        )
+        
+        voxel_grid[32] = min_bound[0] + i * voxel_size[0]
+        voxel_grid[33] = min_bound[1] + j * voxel_size[1]
+        voxel_grid[34] = min_bound[2] + k * voxel_size[2]
+        
+        # === 如果没有提供位姿，返回全局特征（向后兼容） ===
+        if speaker_pose is None or listener_pose is None:
+            # 初始化ResNet3D（全局模式）
+            if not hasattr(self, 'resnet3d'):
+                self.resnet3d = ResNet3D_helper(
+                    in_channels=35, 
+                    backbone='resnet152', 
+                    pretrained=False, 
+                    grid_step=1/grid_size, 
+                    N_features=1024
+                ).cuda()
+            
+            feat_grid_full = voxel_grid.unsqueeze(0)
+            res_feat = self.resnet3d(feat_grid_full)
+            feat_grid_full = res_feat.flatten()
+            return feat_grid_full
+        
+        # === 提取局部特征 ===
+        
+        # 确保输入是批量的
+        if speaker_pose.dim() == 1:
+            speaker_pose = speaker_pose.unsqueeze(0)
+        if listener_pose.dim() == 1:
+            listener_pose = listener_pose.unsqueeze(0)
+        
+        batch_size = speaker_pose.shape[0]
+        
+        # 将位置转换为网格索引
+        speaker_indices = ((speaker_pose - min_bound) / voxel_size).long()  # [B, 3]
+        listener_indices = ((listener_pose - min_bound) / voxel_size).long()  # [B, 3]
+        
+        # 提取局部网格
+        half_size = local_size // 2
+        local_features = []
+        
+        for b in range(batch_size):
+            # 扬声器周围的9x9x9网格
+            speaker_idx = speaker_indices[b]  # [3]
+            speaker_min = (speaker_idx - half_size).clamp(0, grid_size - local_size)
+            speaker_max = speaker_min + local_size
+            
+            speaker_local = voxel_grid[
+                :, 
+                speaker_min[0]:speaker_max[0],
+                speaker_min[1]:speaker_max[1],
+                speaker_min[2]:speaker_max[2]
+            ]  # [35, 9, 9, 9]
+            
+            # 听者周围的9x9x9网格
+            listener_idx = listener_indices[b]  # [3]
+            listener_min = (listener_idx - half_size).clamp(0, grid_size - local_size)
+            listener_max = listener_min + local_size
+            
+            listener_local = voxel_grid[
+                :, 
+                listener_min[0]:listener_max[0],
+                listener_min[1]:listener_max[1],
+                listener_min[2]:listener_max[2]
+            ]  # [35, 9, 9, 9]
+            
+            # 拼接扬声器和听者的局部网格 [70, 9, 9, 9]
+            combined_local = torch.cat([speaker_local, listener_local], dim=0)
+            
+            local_features.append(combined_local)
+        
+        # 堆叠所有batch: [B, 70, 9, 9, 9]
+        local_features = torch.stack(local_features, dim=0)
+        
+        # 初始化局部特征池化网络（保持通道数，只池化空间维度）
+        if not hasattr(self, 'local_pooling_net'):
+            self.local_pooling_net = nn.Sequential(
+                # 使用3D卷积进行特征提取，保持通道数70
+                nn.Conv3d(70, 70, kernel_size=3, padding=1, groups=70),  # depth-wise conv
+                nn.BatchNorm3d(70),
+                nn.ReLU(inplace=True),
+                # 自适应平均池化：9x9x9 -> 1x1x1
+                nn.AdaptiveAvgPool3d(1)
+            ).cuda()
+        
+        # 通过网络：[B, 70, 9, 9, 9] -> [B, 70, 1, 1, 1]
+        local_feat = self.local_pooling_net(local_features)
+        
+        # Flatten: [B, 70, 1, 1, 1] -> [B, 70]
+        local_feat = local_feat.view(batch_size, -1)
+        
+        return local_feat
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -405,6 +531,12 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
             ]
+            # 添加ResNet3D参数到优化器（如果存在）
+            if hasattr(self, 'resnet3d'):
+                l.append({'params': self.resnet3d.parameters(), 'lr': training_args.feature_lr * 0.1, "name": "resnet3d"})
+            # 添加局部池化网络参数到优化器（如果存在）
+            if hasattr(self, 'local_pooling_net'):
+                l.append({'params': self.local_pooling_net.parameters(), 'lr': training_args.feature_lr * 0.1, "name": "local_pooling_net"})
         elif self.appearance_dim > 0:
             l = [
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
@@ -419,6 +551,12 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
             ]
+            # 添加ResNet3D参数到优化器（如果存在）
+            if hasattr(self, 'resnet3d'):
+                l.append({'params': self.resnet3d.parameters(), 'lr': training_args.feature_lr * 0.1, "name": "resnet3d"})
+            # 添加局部池化网络参数到优化器（如果存在）
+            if hasattr(self, 'local_pooling_net'):
+                l.append({'params': self.local_pooling_net.parameters(), 'lr': training_args.feature_lr * 0.1, "name": "local_pooling_net"})
         else:
             l = [
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
@@ -432,6 +570,12 @@ class GaussianModel:
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
             ]
+            # 添加ResNet3D参数到优化器（如果存在）
+            if hasattr(self, 'resnet3d'):
+                l.append({'params': self.resnet3d.parameters(), 'lr': training_args.feature_lr * 0.1, "name": "resnet3d"})
+            # 添加局部池化网络参数到优化器（如果存在）
+            if hasattr(self, 'local_pooling_net'):
+                l.append({'params': self.local_pooling_net.parameters(), 'lr': training_args.feature_lr * 0.1, "name": "local_pooling_net"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -467,6 +611,20 @@ class GaussianModel:
                                                         lr_final=training_args.appearance_lr_final,
                                                         lr_delay_mult=training_args.appearance_lr_delay_mult,
                                                         max_steps=training_args.appearance_lr_max_steps)
+        
+        # 为ResNet3D添加学习率调度（如果存在）
+        if hasattr(self, 'resnet3d'):
+            self.resnet3d_scheduler_args = get_expon_lr_func(lr_init=training_args.feature_lr * 0.1,
+                                                        lr_final=training_args.feature_lr * 0.01,
+                                                        lr_delay_mult=training_args.position_lr_delay_mult,
+                                                        max_steps=training_args.position_lr_max_steps)
+        
+        # 为局部池化网络添加学习率调度（如果存在）
+        if hasattr(self, 'local_pooling_net'):
+            self.local_pooling_net_scheduler_args = get_expon_lr_func(lr_init=training_args.feature_lr * 0.1,
+                                                        lr_final=training_args.feature_lr * 0.01,
+                                                        lr_delay_mult=training_args.position_lr_delay_mult,
+                                                        max_steps=training_args.position_lr_max_steps)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -491,6 +649,12 @@ class GaussianModel:
                 param_group['lr'] = lr
             if self.appearance_dim > 0 and param_group["name"] == "embedding_appearance":
                 lr = self.appearance_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if hasattr(self, 'resnet3d') and param_group["name"] == "resnet3d":
+                lr = self.resnet3d_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if hasattr(self, 'local_pooling_net') and param_group["name"] == "local_pooling_net":
+                lr = self.local_pooling_net_scheduler_args(iteration)
                 param_group['lr'] = lr
             
             
