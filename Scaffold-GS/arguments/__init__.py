@@ -482,7 +482,7 @@ class RAFDataset(Dataset):
 
     def __init__(self,
                  dataparser_outputs: RAFDataparserOutputs,
-                 mode: Literal["train","eval","eval_image","inference"] = "train",
+                 mode: Literal["train","train_full","eval","eval_image","inference"] = "train",
                  max_len: int = 100,            # num STFT frames per audio used for slicing
                  max_len_time: float = 0.32,    # seconds of RIR considered
                  wav_path: Path = None,
@@ -512,7 +512,7 @@ class RAFDataset(Dataset):
     def __len__(self):
         if self.mode in ["train","eval"]:
             return len(self._dpo.audios_filenames) * self.max_len
-        elif self.mode in ["eval_image", "inference"]:
+        elif self.mode in ["train_full", "eval_full", "eval_image", "inference"]:
             return len(self._dpo.audios_filenames)
         return len(self._dpo.audios_filenames)
 
@@ -557,6 +557,72 @@ class RAFDataset(Dataset):
             rot = self._dpo.source_rotations[audio_idx]
             return {"audio_idx": audio_idx, "data": stft, "waveform": waveform,
                     "rot": rot, "mic_pose": mic_pose, "source_pose": src_pose}
+
+        elif self.mode == "train_full":
+            # 完整音频训练模式 - 返回完整 STFT 和波形，用于训练完整音频
+            audio_idx = index
+            audio_id = self._dpo.audios_filenames[audio_idx]
+            wav = self._load_rir(audio_id)
+            stft_log = self._stft_logmag(wav)   # [F, T]
+            
+            # 裁剪或填充到 max_len
+            Tlen = min(stft_log.shape[1], self.max_len)
+            full_stft = stft_log[:, :Tlen]
+            if full_stft.shape[1] < self.max_len:
+                pad = torch.full((full_stft.shape[0], self.max_len - full_stft.shape[1]), full_stft.min())
+                full_stft = torch.cat([full_stft, pad], dim=1)
+            
+            # 返回完整波形和 STFT
+            waveform = torch.from_numpy(wav)
+            mic_pose = self._dpo.microphone_poses[audio_idx]
+            src_pose = self._dpo.source_poses[audio_idx]
+            rot = self._dpo.source_rotations[audio_idx]
+            
+            # 生成时间查询序列
+            time_query = torch.arange(Tlen, dtype=torch.float32)
+            
+            return {
+                "audio_idx": audio_idx, 
+                "data": full_stft.unsqueeze(0),  # [1, F, T] 保持与 NeRAF 一致
+                "waveform": waveform.unsqueeze(0),  # [1, T] 单通道
+                "time_query": time_query,  # [T] 时间查询序列
+                "rot": rot, 
+                "mic_pose": mic_pose, 
+                "source_pose": src_pose
+            }
+
+        elif self.mode == "eval_full":
+            # 完整音频评估模式 - 返回完整 STFT 和波形，用于全音频评估
+            audio_idx = index
+            audio_id = self._dpo.audios_filenames[audio_idx]
+            wav = self._load_rir(audio_id)
+            stft_log = self._stft_logmag(wav)   # [F, T]
+            
+            # 裁剪或填充到 max_len
+            Tlen = min(stft_log.shape[1], self.max_len)
+            full_stft = stft_log[:, :Tlen]
+            if full_stft.shape[1] < self.max_len:
+                pad = torch.full((full_stft.shape[0], self.max_len - full_stft.shape[1]), full_stft.min())
+                full_stft = torch.cat([full_stft, pad], dim=1)
+            
+            # 返回完整波形和 STFT
+            waveform = torch.from_numpy(wav)
+            mic_pose = self._dpo.microphone_poses[audio_idx]
+            src_pose = self._dpo.source_poses[audio_idx]
+            rot = self._dpo.source_rotations[audio_idx]
+            
+            # 生成时间查询序列
+            time_query = torch.arange(Tlen, dtype=torch.float32)
+            
+            return {
+                "audio_idx": audio_idx, 
+                "data": full_stft.unsqueeze(0),  # [1, F, T] 保持与 NeRAF 一致
+                "waveform": waveform.unsqueeze(0),  # [1, T] 单通道
+                "time_query": time_query,  # [T] 时间查询序列
+                "rot": rot, 
+                "mic_pose": mic_pose, 
+                "source_pose": src_pose
+            }
 
         elif self.mode == "eval_image":
             # 完整音频评估模式 - 返回完整 STFT 和波形，用于计算 T60/EDT/C50
