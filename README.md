@@ -89,5 +89,38 @@ NeRAF_dataset=RAF NeRAF_scene=FurnishedRoom ns-train NeRAF
 ns-eval --load-config [CONFIG_PATH to config.yml] --output-path [OUTPUT_PATH to out_name.json] --render-output-path [RENDER_OUTPUT_PATH to folder conainting rendered images and audio in the eval set]
 ```
 
+## 3 ScaffoldGS Environment Setup and Usage
+### 3.1 Install Missing Dependencies
+```
+git clone this github
+cd scaffold-gs
+```
 
+### 3.2 Training Process
+Modify Data Path
+Edit the train_raf.sh script to set the correct data path:
+```
+# Open train_raf.sh and update the data path
+nano train_raf.sh
+# Change the --data_path argument to point to your RAF dataset
+```
+Run Training
+```
+./train_raf.sh
+```
 
+### 3.3 Sound Field Testing
+To test the sound field reconstruction:
+```
+./evaluate_audio.sh ./output/my_model/audio_ckpts/audio_iter_200.pth /path/to/raf local
+```
+
+### 3.4 Light Field Testing
+Render Images
+```
+python render.py -m <path to trained model dir>
+```
+Evaluate Results
+```
+python metrics.py -m <path to trained model dir>
+```
