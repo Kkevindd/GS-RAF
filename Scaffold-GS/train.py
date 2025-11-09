@@ -150,21 +150,21 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     logger.info(f"[Audio] Audio network input size: {in_size}")
     audio_field = NeRAFAudioSoundField(in_size=in_size, W=audio_W, sound_rez=1, N_frequencies=audio_F).cuda()
 
-    # optimizer for audio only - 参考NeRAF配置
+    # optimizer for audio only - 参考NeRAF配置，但考虑声场训练10轮的情况
     audio_lr_init = 1e-4
     audio_lr_final = 1e-8  # NeRAF使用更小的最终学习率
     audio_lr_delay_mult = 0.01
-    audio_lr_max_steps = 200000  
-    start_step_audio = 2000  
+    audio_lr_max_steps = 200000  # 声场训练的总步数：光场10万轮 × 10 = 声场100万轮
+    start_step_audio = 2000  # 音频训练开始步数（对应光场1000轮）
     
     # 创建音频学习率调度器 - 基于声场训练步数而不是iteration
     from utils.general_utils import get_expon_lr_func
     audio_scheduler_args = get_expon_lr_func(
         lr_init=audio_lr_init,
         lr_final=audio_lr_final,
-        lr_delay_steps=start_step_audio,  
+        lr_delay_steps=start_step_audio,  # 延迟到10000步开始（对应光场1000轮）
         lr_delay_mult=audio_lr_delay_mult,
-        max_steps=audio_lr_max_steps + start_step_audio  # 总步数包含延迟步数
+        max_steps=audio_lr_max_steps + start_step_audio/10  # 总步数包含延迟步数
     )
     
     # 添加全局音频步数计数器
@@ -391,10 +391,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
                 # ---------------- Train audio after 15000 iterations ----------------
         if raf_loader is not None and iteration >= start_step_audio:   #训练声场
-            # 声场训练：每次进入时训练n轮，n=1
-            n = 1
-            logger.info(f"[Training Mode] Iteration {iteration}: 开始声场训练（{n}轮）")
-            for audio_step in range(n):
+            # 声场训练：每次进入时训练10轮
+            logger.info(f"[Training Mode] Iteration {iteration}: 开始声场训练（10轮）")
+            for audio_step in range(1):
                 # 更新音频学习率 - 基于全局音频步数
                 global_audio_step += 1
                 current_audio_lr = audio_scheduler_args(global_audio_step)
@@ -449,9 +448,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 
                 # 使用NeRAF的STFTLoss - 严格单帧STFT切片训练
                 loss_dict = criterion_audio(pred, gt)
-                
+                loss_factor = 1e-6
                 # 按照NeRAF的权重组合损失
-                audio_loss = 1.0 * loss_dict['audio_sc_loss'] + 1.0 * loss_dict['audio_mag_loss']
+                audio_loss = (0.1 * loss_dict['audio_sc_loss'] + 1.0 * loss_dict['audio_mag_loss'])*loss_factor
                 
                 # 调试：监控音频输出幅度范围和学习率
                 if iteration % 100 == 0 and audio_step == 0:  # 只在第一次时打印调试信息
@@ -564,7 +563,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         
                         # 计算评估损失（使用STFTLoss）
                         eval_loss_dict = criterion_audio(pred, gt)
-                        eval_total_loss = 1.0 * eval_loss_dict['audio_sc_loss'] + 1.0 * eval_loss_dict['audio_mag_loss']
+                        loss_factor=1e-6
+                        eval_total_loss = (0.1 * eval_loss_dict['audio_sc_loss'] + 1.0 * eval_loss_dict['audio_mag_loss'])*loss_factor
                         
                         logger.info(f"[Eval/Audio] iter {iteration}: SC loss {eval_loss_dict['audio_sc_loss'].item():.6f}, Mag loss {eval_loss_dict['audio_mag_loss'].item():.6f}, Total {eval_total_loss.item():.6f}")
                         if tb_writer:
@@ -930,7 +930,7 @@ def evaluate_audio_field_periodic(model_path, raf_data_root, raf_fs, raf_max_len
         # 2. 重建音频网络
         from nerfstudio.field_components.encodings import NeRFEncoding, SHEncoding
         import torch.nn as nn
-        import torch.nn.functional as F
+        import torch.nn.functional as F 
         
         time_enc = NeRFEncoding(in_dim=1, num_frequencies=10, min_freq_exp=0.0, max_freq_exp=8.0, include_input=True)
         pos_enc = NeRFEncoding(in_dim=3, num_frequencies=10, min_freq_exp=0.0, max_freq_exp=8.0, include_input=True)
@@ -1088,189 +1088,6 @@ def evaluate_audio_field_periodic(model_path, raf_data_root, raf_fs, raf_max_len
         logger.error(f"[Periodic Audio Eval] Periodic audio evaluation failed: {e}")
         raise
 
-def evaluate_audio_field(model_path, raf_data_root, raf_fs, raf_max_len_s, hop_len, max_len_frames, logger):
-    """评估音频场的STFT指标（简化版）"""
-    try:
-        # 导入必要的模块
-        from arguments import RAFDataParserConfig, RAFDataParser, RAFDataset
-        from torch.utils.data import DataLoader
-        from nerfstudio.field_components.encodings import NeRFEncoding, SHEncoding
-        import torch.nn as nn
-        import torch.nn.functional as F
-        import numpy as np
-        
-        logger.info(f"[Audio Eval] Starting audio field evaluation...")
-        logger.info(f"[Audio Eval] Model path: {model_path}")
-        logger.info(f"[Audio Eval] RAF data: {raf_data_root}")
-        
-        criterion_audio = STFTLoss(loss_type='mse')
-        
-        # 1. 加载音频检查点
-        audio_ckpt_dir = os.path.join(model_path, "audio_ckpts")
-        audio_ckpt_files = [f for f in os.listdir(audio_ckpt_dir) if f.startswith('audio_') and f.endswith('.pth')]
-        audio_ckpt_files.sort()
-        latest_ckpt = audio_ckpt_files[-1]
-        ckpt_path = os.path.join(audio_ckpt_dir, latest_ckpt)
-        
-        checkpoint = torch.load(ckpt_path, map_location='cpu')
-        logger.info(f"[Audio Eval] Loaded checkpoint: {latest_ckpt}")
-        
-        # 2. 重建音频网络
-        time_enc = NeRFEncoding(in_dim=1, num_frequencies=10, min_freq_exp=0.0, max_freq_exp=8.0, include_input=True)
-        pos_enc = NeRFEncoding(in_dim=3, num_frequencies=10, min_freq_exp=0.0, max_freq_exp=8.0, include_input=True)
-        rot_enc = SHEncoding(levels=4, implementation="tcnn")
-        
-        time_dim = time_enc.get_out_dim()
-        pos_dim = pos_enc.get_out_dim()
-        rot_dim = rot_enc.get_out_dim()
-        
-        audio_W = 512
-        audio_F = 513
-        grid_feat_dim = 70  # 局部网格特征维度
-        in_size = grid_feat_dim + time_dim + 2 * pos_dim + rot_dim
-        
-    
-        
-        audio_field = NeRAFAudioSoundField(in_size=in_size, W=audio_W, sound_rez=1, N_frequencies=audio_F)
-        
-        # 加载权重
-        if checkpoint.get("time_enc") is not None:
-            time_enc.load_state_dict(checkpoint["time_enc"])
-        if checkpoint.get("pos_enc") is not None:
-            pos_enc.load_state_dict(checkpoint["pos_enc"])
-        if checkpoint.get("rot_enc") is not None:
-            rot_enc.load_state_dict(checkpoint["rot_enc"])
-        
-        audio_field.load_state_dict(checkpoint["audio_field"])
-        
-        # 移动到设备
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        time_enc = time_enc.to(device)
-        pos_enc = pos_enc.to(device)
-        rot_enc = rot_enc.to(device)
-        audio_field = audio_field.to(device)
-        audio_field.eval()
-        
-        # 3. 加载评估数据
-        dp_cfg = RAFDataParserConfig(data=Path(raf_data_root))
-        dp = RAFDataParser(dp_cfg)
-        dpo_test = dp.get_dataparser_outputs(split="test")
-        
-        # 创建STFT切片评估数据集
-        raf_eval_ds = RAFDataset(
-            dataparser_outputs=dpo_test,
-            mode='eval',  # STFT切片评估
-            max_len=max_len_frames,
-            max_len_time=raf_max_len_s,
-            wav_path=os.path.join(raf_data_root, 'data'),
-            fs=raf_fs, 
-            hop_len=hop_len,
-        )
-        
-        eval_loader = DataLoader(raf_eval_ds, batch_size=16, shuffle=False, num_workers=2)
-        
-        # 4. 执行评估
-        logger.info(f"[Audio Eval] Evaluating {len(raf_eval_ds)} STFT slices...")
-        
-        all_metrics = []
-        
-        for batch_idx, batch in enumerate(eval_loader):
-            try:
-                with torch.no_grad():
-                    # 预测STFT切片
-                    time_query = batch['time_query'].to(device).float().unsqueeze(-1)
-                    t_norm = time_query.float() / float(max_len_frames - 1.0)
-                    t_feat = time_enc(t_norm)
-                    
-                    # 使用保存的边界信息
-                    min_bound = torch.tensor(checkpoint["aabb_min"]).to(device)
-                    max_bound = torch.tensor(checkpoint["aabb_max"]).to(device)
-                    extent = (max_bound - min_bound).clamp_min(1e-6)
-                    
-                    mic_pose = batch['mic_pose'].to(device).float()
-                    src_pose = batch['source_pose'].to(device).float()
-                    mic01 = ((mic_pose - min_bound) / extent).clamp(0.0, 1.0)
-                    src01 = ((src_pose - min_bound) / extent).clamp(0.0, 1.0)
-                    mic_feat = pos_enc(mic01)
-                    src_feat = pos_enc(src01)
-                    
-                    rot = batch['rot'].to(device).float()
-                    rot_feat = rot_enc(rot)
-                    
-                    # 使用保存的网格特征
-                    grid_feat = torch.tensor(checkpoint["grid_feature"]).to(device)
-                    B = t_feat.shape[0]
-                    grid_feat = grid_feat.unsqueeze(0).expand(B, -1)
-                    
-                    h = torch.cat([grid_feat, t_feat, mic_feat, src_feat, rot_feat], dim=-1)
-                    field_outputs = audio_field(h)  # [B, C, F] where B=batch_size, C=1, F=frequencies
-                    
-                    # 对于STFT切片模式，输出应该是 [B, 1, F]，我们需要 [B, F]
-                    pred_log_stft = field_outputs.squeeze(1)  # [B, F] log-magnitude
-                    
-                    # 获取真实数据
-                    gt_log_stft = batch['data'].to(device).float()
-                    
-                    # 计算STFT损失
-                    loss_dict = criterion_audio(pred_log_stft, gt_log_stft)
-                    total_loss =1.0 * loss_dict['audio_sc_loss'] + 1.0 * loss_dict['audio_mag_loss']
-                    
-                    metrics = {
-                        'stft_sc_loss': loss_dict['audio_sc_loss'].item(),
-                        'stft_mag_loss': loss_dict['audio_mag_loss'].item(),
-                        'stft_total_loss': total_loss.item(),
-                    }
-                    
-                    all_metrics.append(metrics)
-                    
-                    if batch_idx % 100 == 0:
-                        logger.info(f"[Audio Eval] Processed {batch_idx + 1}/{len(eval_loader)} STFT slices")
-                        
-            except Exception as e:
-                logger.error(f"[Audio Eval] Error evaluating STFT slice {batch_idx}: {e}")
-                continue
-        
-        # 5. 计算平均指标
-        if all_metrics:
-            avg_metrics = {}
-            for key in all_metrics[0].keys():
-                values = [m[key] for m in all_metrics]
-                avg_metrics[key] = np.mean(values)
-                avg_metrics[f"{key}_std"] = np.std(values)
-            
-            # 6. 保存和打印结果
-            results_dir = os.path.join(model_path, "audio_evaluation_results")
-            os.makedirs(results_dir, exist_ok=True)
-            
-            avg_file = os.path.join(results_dir, "average_metrics.json")
-            with open(avg_file, 'w') as f:
-                json.dump(avg_metrics, f, indent=2)
-            
-            all_file = os.path.join(results_dir, "all_samples_metrics.json")
-            with open(all_file, 'w') as f:
-                json.dump(all_metrics, f, indent=2)
-            
-            # 打印结果
-            logger.info("=" * 60)
-            logger.info("SCAFFOLDGS + RAF AUDIO FIELD EVALUATION RESULTS")
-            logger.info("=" * 60)
-            
-            for key, value in avg_metrics.items():
-                if not key.endswith('_std'):
-                    std_key = f"{key}_std"
-                    std_value = avg_metrics.get(std_key, 0)
-                    logger.info(f"{key:30s}: {value:.6f} ± {std_value:.6f}")
-            
-            logger.info("=" * 60)
-            logger.info(f"[Audio Eval] Results saved to: {results_dir}")
-            
-        else:
-            logger.error("[Audio Eval] No valid STFT slices evaluated")
-            
-    except Exception as e:
-        logger.error(f"[Audio Eval] Audio field evaluation failed: {e}")
-        raise
-    
 def get_logger(path):
     import logging
 
@@ -1381,20 +1198,4 @@ if __name__ == "__main__":
     evaluate(args.model_path, visible_count=visible_count, wandb=wandb, logger=logger)
     logger.info("\nEvaluating complete.")
     
-    # Audio field evaluation
-    logger.info("\n Starting audio field evaluation...")
-    try:
-        # 获取RAF数据路径
-        raf_data_root = getattr(lp.extract(args), 'raf_data', '') if hasattr(lp.extract(args), 'raf_data') else ''
-        raf_fs = int(getattr(lp.extract(args), 'raf_fs', 48000))
-        raf_max_len_s = float(getattr(lp.extract(args), 'raf_max_len', 0.32))
-        hop_len = 256 if raf_fs == 48000 else 128
-        max_len_frames = max(1, int(raf_max_len_s * raf_fs / hop_len))
-        
-        if isinstance(raf_data_root, str) and len(raf_data_root) > 0 and os.path.isdir(raf_data_root):
-            evaluate_audio_field(args.model_path, raf_data_root, raf_fs, raf_max_len_s, hop_len, max_len_frames, logger)
-            logger.info("\nAudio field evaluation complete.")
-        else:
-            logger.info(f"\nSkipping audio field evaluation: RAF data not found or not configured")
-    except Exception as e:
-        logger.info(f"\nAudio field evaluation failed: {e}")
+    
